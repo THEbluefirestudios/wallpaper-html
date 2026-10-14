@@ -1,6 +1,7 @@
 {
-  "current_wallpaper_dir": "bhnt",
-  "pause_on_fullscreen": false,
+  "current_wallpaper_dir": "dvdscreensaver",
+  "run_on_startup": false,
   "hide_get_premium": false,
-  "developer_mode": false
+  "developer_mode": false,
+  "pause_on_fullscreen": true
 }

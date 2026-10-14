@@ -9,9 +9,9 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
 import time
 import tkinter as tk
+import winreg
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 #import block for gui stuff
@@ -22,6 +22,10 @@ import sv_ttk
 import webview
 import win32con
 import win32gui
+import win32process
+import psutil
+import threading
+import win32api
 from PIL import Image, ImageTk
 #do this coz pywinstyles is weird and not always installed, so we need to check if its there first
 try:
@@ -35,16 +39,25 @@ WALLPAPERS_DIR = SCRIPT_DIR / "wallpapers"
 SETTINGS_FILE = INTERNAL_DIR / "settings.json"
 ICON_ICO = INTERNAL_DIR / "icon.ico"
 ICON_PNG = INTERNAL_DIR / "icon.png"
+READY_FILE = INTERNAL_DIR / "wallpaper_ready"
+FIRST_FRAME_DELAY = 1.0
+STARTUP_TIMEOUT = 15.0
+
+STARTUP_NAME = "Wallpaper.HTML"
+STARTUP_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_APPROVED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
 
 SCREEN_WIDTH, SCREEN_HEIGHT = pyautogui.size()
 
 CURRENT_SCREEN = 0
 
+#objectivel setings u shuld use
 DEFAULT_SETTINGS = {
     "current_wallpaper_dir": "",
-    "pause_on_fullscreen": True,
+    "run_on_startup": False,
     "hide_get_premium": False,
     "developer_mode": False,
+    "pause_on_fullscreen": True
 }
 
 #the same ol' json funcs i use
@@ -65,19 +78,19 @@ settings = load_settings()
 
 MANIFEST_RE = re.compile(r"^\s*<!--\s*manifest(.*?)-->", re.DOTALL | re.IGNORECASE)
 
-DEFAULTS = {
+MANIFEST_DEFAULTS = {
     "name": "Untitled",
     "thumbnail": None,
     "author": "Unknown",
     "description": "",
 }
 
-#the "manifest", top 4 lines of wallpaper.html that is commented
+#the "manifest", top 4 lines of wallpaper.html that is commented, ill document this dw
 def read_manifest(html_path):
     html_path = Path(html_path)
     text = html_path.read_text(encoding="utf-8-sig")
 
-    manifest = dict(DEFAULTS)
+    manifest = dict(MANIFEST_DEFAULTS)
 
     match = MANIFEST_RE.match(text)
     if not match:
@@ -94,7 +107,7 @@ def read_manifest(html_path):
 
     return manifest
 
-
+#read wallp dir
 def list_wallpapers():
     wallpapers = []
     for folder in sorted(WALLPAPERS_DIR.iterdir()):
@@ -104,40 +117,154 @@ def list_wallpapers():
                 wallpapers.append({**manifest, "dir": folder.name})
     return wallpapers
 
-
-wallpaper_proc = None
+# start, stop and pause wallp
+wallpaper_process = None
+wallpaper_started_at = 0.0
+wallpaper_paused = False
+process_lock = threading.RLock()
 
 
 def start_wallpaper():
-    global wallpaper_proc
+    global wallpaper_process, wallpaper_started_at
     stop_wallpaper()
-    wallpaper_proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--wallpaper"], creationflags=subprocess.CREATE_NO_WINDOW)
+    with process_lock:
+        READY_FILE.unlink(missing_ok=True)
+        wallpaper_started_at = time.monotonic()
+        wallpaper_process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--wallpaper"], creationflags=subprocess.CREATE_NO_WINDOW)
 
 
 def stop_wallpaper():
-    global wallpaper_proc
-    if wallpaper_proc and wallpaper_proc.poll() is None:
-        wallpaper_proc.terminate()
-        wallpaper_proc.wait()
-    wallpaper_proc = None
+    global wallpaper_process, wallpaper_paused
+    with process_lock:
+        if wallpaper_process and wallpaper_process.poll() is None:
+            pause_wallpaper(False)
+            wallpaper_process.terminate()
+            wallpaper_process.wait()
+        wallpaper_process = None
+        wallpaper_paused = False
 
+
+def pause_wallpaper(paused):
+    global wallpaper_paused # this is needed, shi lags so much when minectaft is open, and also eats a bit of my fps
+    with process_lock:
+        if not wallpaper_process or wallpaper_process.poll() is not None or paused == wallpaper_paused:
+            return
+        try:
+            root = psutil.Process(wallpaper_process.pid)
+            for p in [root] + root.children(recursive=True):
+                try:
+                    p.suspend() if paused else p.resume()
+                except psutil.Error:
+                    pass
+        except psutil.Error:
+            return
+        wallpaper_paused = paused
+
+
+IGNORED_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+
+#took help of claude using my new credits i bought
+#making contstants coz i had trouble tweaking these
+COVER_TOLERANCE = 0 #pixles forgiven, like if a window is 1px off the edge, it still counts as covering the desktop
+COVER_GRID_COLUMNS = 24 # sample area on x axis
+COVER_GRID_ROWS = 14# sample area on y axis
+IGNORED_EXTENDED_STYLES = win32con.WS_EX_TRANSPARENT | win32con.WS_EX_NOACTIVATE | win32con.WS_EX_TOOLWINDOW
+
+
+def is_cloaked(hwnd):
+    cloaked = ctypes.c_int(0)
+    ctypes.windll.dwmapi.DwmGetWindowAttribute(ctypes.c_void_p(hwnd), 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+    return cloaked.value != 0
+
+
+def get_visible_rect(hwnd):
+    rect = (ctypes.c_long * 4)()
+    if ctypes.windll.dwmapi.DwmGetWindowAttribute(ctypes.c_void_p(hwnd), 9, rect, ctypes.sizeof(rect)) == 0:
+        return tuple(rect)
+    return win32gui.GetWindowRect(hwnd)
+
+
+def get_covering_rects():
+    process = wallpaper_process
+    wallpaper_process_id = process.pid if process else None
+    rects = []
+
+    def collect(hwnd, _):
+        try:
+            if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+                return True
+            if win32gui.GetClassName(hwnd) in IGNORED_CLASSES or is_cloaked(hwnd):
+                return True
+            if win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE) & IGNORED_EXTENDED_STYLES:
+                return True
+            if win32process.GetWindowThreadProcessId(hwnd)[1] == wallpaper_process_id:
+                return True
+            rects.append(get_visible_rect(hwnd))
+        except Exception:
+            pass
+        return True
+
+    win32gui.EnumWindows(collect, None)
+    return rects
+
+
+def is_desktop_covered():
+    monitor = win32api.MonitorFromPoint((0, 0), win32con.MONITOR_DEFAULTTOPRIMARY)
+    left, top, right, bottom = win32api.GetMonitorInfo(monitor)["Work"]
+    rects = [(rect[0] - COVER_TOLERANCE, rect[1] - COVER_TOLERANCE, rect[2] + COVER_TOLERANCE, rect[3] + COVER_TOLERANCE) for rect in get_covering_rects()]
+    if not rects:
+        return False
+    for column in range(COVER_GRID_COLUMNS):
+        x = left + (column + 0.5) * (right - left) / COVER_GRID_COLUMNS
+        for row in range(COVER_GRID_ROWS):
+            y = top + (row + 0.5) * (bottom - top) / COVER_GRID_ROWS
+            if not any(rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3] for rect in rects):
+                return False
+    return True
+
+
+def is_wallpaper_ready():
+    return READY_FILE.exists() or time.monotonic() - wallpaper_started_at > STARTUP_TIMEOUT
+
+
+def fullscreen_watcher(): #me watch if fsc app
+    while True:
+        try:
+            want_paused = settings["pause_on_fullscreen"] and is_wallpaper_ready() and is_desktop_covered()
+        except Exception:
+            want_paused = False
+        pause_wallpaper(want_paused)
+        time.sleep(1)
 
 def set_wallpaper(name):
     settings["current_wallpaper_dir"] = name
     save_settings()
     if name:
         start_wallpaper()
+        
     else:
         stop_wallpaper()
 
 
+def set_startup(enabled):
+    if enabled:
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
+        exe = pythonw if pythonw.exists() else Path(sys.executable)
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, STARTUP_NAME, 0, winreg.REG_SZ, f'"{exe}" "{Path(__file__).resolve()}"')
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, STARTUP_APPROVED_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, STARTUP_NAME, 0, winreg.REG_BINARY, b"\x02" + bytes(11))
+    else:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, STARTUP_NAME)
+        except FileNotFoundError:
+            pass
+
+
 TITLE = "Wallpaper"
 
-#the js for like pausing wllpapers, like lively!
-PAUSE_JS = "document.querySelectorAll('video').forEach(v => v.pause()); document.dispatchEvent(new Event('wallpaper-pause'));"
-RESUME_JS = "document.querySelectorAll('video').forEach(v => v.play().catch(() => {})); document.dispatchEvent(new Event('wallpaper-resume'));"
-
-#quick find progman, send that one code, find workerw, also in win11 i think worker w is chil or progman, and dis app for win11 and 10, so both methods merged to 1
+#quick find progman, send that one code, find workerw, also in win11 i think worker w is child of progman, and dis app for win11 and 10, so both methods merged to 1
 def get_desktop_parent():
     progman = win32gui.FindWindow("Progman", None)
     win32gui.SendMessageTimeout(progman, 0x052C, 0, 0, win32con.SMTO_NORMAL, 1000)
@@ -154,33 +281,6 @@ def get_desktop_parent():
 
     win32gui.EnumWindows(enum_cb, None)
     return found or progman
-
-#shuld it?
-def should_pause():
-    fg = win32gui.GetForegroundWindow()
-
-    if not fg or not win32gui.IsWindowVisible(fg) or win32gui.IsIconic(fg):
-        return False
-
-    if win32gui.GetClassName(fg) in {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}:
-        return False
-    
-    left, top, right, bottom = win32gui.GetWindowRect(fg)
-    covers_screen = left <= 0 and top <= 0 and right >= SCREEN_WIDTH and bottom >= SCREEN_HEIGHT
-    return covers_screen or bool(win32gui.IsZoomed(fg)) #type: ignore
-
-
-def watch_fullscreen(window):
-    paused = False
-    while True:
-        try:
-            want = load_settings()["pause_on_fullscreen"] and should_pause()
-            if want != paused:
-                window.evaluate_js(PAUSE_JS if want else RESUME_JS)
-                paused = want
-        except Exception as e:
-            print("watcher error:", e)
-        time.sleep(1)
 
 
 def attach_to_desktop(window):
@@ -211,18 +311,25 @@ def attach_to_desktop(window):
     h = ctypes.windll.user32.GetSystemMetrics(1)
     win32gui.SetWindowPos(hwnd, win32con.HWND_BOTTOM, 0, 0, w, h,  win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW)
 
-    threading.Thread(target=watch_fullscreen, args=(window,), daemon=True).start()
-
 
 def run_wallpaper():
     global TITLE
-    os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = '--host-rules="MAP * ~NOTFOUND, EXCLUDE localhost"'
+    os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = (
+        '--autoplay-policy=no-user-gesture-required '
+        '--host-rules="MAP * ~NOTFOUND, EXCLUDE localhost"'
+    )
     html_file = WALLPAPERS_DIR / settings["current_wallpaper_dir"] / "wallpaper.html"
     manifest = read_manifest(html_file)
 
     if manifest["name"] != "Untitled":
         TITLE = manifest["name"]
         window = webview.create_window(TITLE, html_file.resolve().as_uri(), frameless=True, easy_drag=False, x=0, y=0, width=SCREEN_WIDTH, height=SCREEN_HEIGHT, js_api=None)
+
+        def on_loaded():
+            time.sleep(FIRST_FRAME_DELAY)
+            READY_FILE.write_text("ready")
+
+        window.events.loaded += on_loaded  #type: ignore
         webview.start(attach_to_desktop, window) #type: ignore
     else:
         print(f"Manifest for wallpaper '{settings['current_wallpaper_dir']}' is missing or invalid.")
@@ -239,6 +346,34 @@ def load_image(path, size):
     photo = ImageTk.PhotoImage(img)
     images.append(photo)
     return photo
+
+
+def create_premium_satire_window():
+    win_premium = tk.Toplevel()
+    win_premium.title("Wallpaper.HTML Premium")
+    win_premium.iconbitmap(str(ICON_ICO))
+    win.update()
+    apply_theme_to_titlebar(win_premium)
+    win.deiconify()
+    win_premium.geometry("500x500")
+    win_premium.resizable(False, False)
+    win_premium.transient(win)
+
+    premium_label_frame = ttk.Frame(win_premium, padding=20)
+    premium_label_frame.pack(pady=10, padx=20, fill="x")
+    ttk.Label(premium_label_frame, text="Wallpaper.HTML Premium", font=("Courier", 18, "bold")).pack(pady=20, side="left")
+    premium_icon = load_image(ICON_PNG, (48, 48))
+    ttk.Label(premium_label_frame,  image=premium_icon).pack(pady=10, side="right") #type:ignore
+    ttk.Label(win_premium, text="You already HAVE PREMIUM! 😭🥀💀", font=("Segoe UI", 14)).pack(pady=10)
+
+    premium_card_frame = ttk.Frame(win_premium, style="Card.TFrame", padding=20)
+    premium_card_frame.pack(pady=20, padx=20, fill="both", expand=True)
+    ttk.Label(premium_card_frame, text="Premium Features: (free btw)", font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 10))
+    ttk.Separator(premium_card_frame, orient="horizontal").pack(fill="x", pady=(0, 10))
+    ttk.Label(premium_card_frame, text="Everything in free:\n• All wallpapers are free to use and share.\n• No ads\n• Full access to all features.\n• Support the developer and future updates.", font=("Segoe UI", 12), justify="left").pack(anchor="w")
+    win.update()
+    apply_theme_to_titlebar(win_premium)
+    win.deiconify()
 
 
 def apply_theme_to_titlebar(root):
@@ -267,8 +402,7 @@ def build_topbar():
     topbar_title = ttk.Label(topbar_frame, text=" Wallpaper.HTML", image=header_icon, compound="left", font=("Courier", 16, "bold")) #type: ignore
     topbar_title.pack(side="left", padx=15, pady = 10)
 
-    topbar_addbtn = ttk.Button(topbar_frame, text=" 💎 Get Premium", style="Accent.TButton",
-                               command=lambda: messagebox.showinfo("Wallpaper.HTML", "Premium unlocked! (It's free.)"))
+    topbar_addbtn = ttk.Button(topbar_frame, text=" 💎 Get Premium", style="Accent.TButton", command=create_premium_satire_window)
     toggle_see_premium_btn()
 
     topbar_hsep = ttk.Separator(win, orient="horizontal")
@@ -291,7 +425,6 @@ def build_sidebar():
     sidebar_wp_btn.pack(pady=5, padx=10, fill="x")
     sidebar_st_btn = ttk.Button(sidebar_frame, text="⚙️ Settings", command=lambda: show_screen(1), style="Accent.TButton" if CURRENT_SCREEN==1 else "Unaccent.TButton")
     sidebar_st_btn.pack(pady=5, padx=10, fill="x")
-    # Add more widgets to the sidebar as needed, no more
 
 #highliight the current scren btn, tk dosent have hamburger menus, so like this the closest thing we have :((
 def show_screen(index):
@@ -302,7 +435,7 @@ def show_screen(index):
     sidebar_st_btn.configure(style="Accent.TButton" if index == 1 else "Unaccent.TButton")
     build_screen(index)
 
-
+#funcs for btns and shi
 def add_wallpaper():
     chosen = filedialog.askdirectory()
     if not chosen:
@@ -354,7 +487,7 @@ def build_card_list(parent):
     canvas.bind_all("<MouseWheel>", lambda e: canvas.winfo_exists() and canvas.yview_scroll(int(-e.delta / 120), "units"))
     return inner
 
-
+# thw wallp card
 def build_wallpaper_card(parent, info):
     active = settings["current_wallpaper_dir"] == info["dir"]
 
@@ -412,6 +545,7 @@ def build_screen(crnt_scrn):
 
         for info in list_wallpapers():
             build_wallpaper_card(card_list, info)
+
     elif crnt_scrn == 1:
         settings_frame = ttk.Frame(win)
         settings_frame.pack(side="right", fill="both", expand=True)
@@ -419,9 +553,10 @@ def build_screen(crnt_scrn):
         settings_label = ttk.Label(settings_frame, text="Settings:", font=("Segoe UI", 14))
         settings_label.pack(pady=20)
 
-        add_setting_row(settings_frame, "Pause Wallpaper on Fullscreen: ", "pause_on_fullscreen")
+        add_setting_row(settings_frame, "Run Wallpaper.HTML on Startup: ", "run_on_startup", lambda: set_startup(settings["run_on_startup"]))
         add_setting_row(settings_frame, "Hide \"Get Premium\" option: ", "hide_get_premium", toggle_see_premium_btn)
         add_setting_row(settings_frame, "Developer Mode (Allow Non-verified wallpapers): ", "developer_mode")
+        add_setting_row(settings_frame, "Pause wallpaper on fullscreened app: ", "pause_on_fullscreen")
 
 
 def build_ui():
@@ -445,6 +580,8 @@ if "--wallpaper" in sys.argv:
 # if __name__ == "__main__": i dont remebr why i commented this, and then i forgot, and it still works so why should i care
 WALLPAPERS_DIR.mkdir(exist_ok=True)
 win = tk.Tk()
+
+win.withdraw()
 win.iconbitmap(str(ICON_ICO))
 win.geometry("960x540")
 win.minsize(800, 450)
@@ -455,12 +592,15 @@ win.update()
 apply_theme_to_titlebar(win)
 build_ui()
 
-tray = pystray.Icon("wallpaper_html", Image.open(ICON_ICO), "Wallpaper.HTML", pystray.Menu(
-    pystray.MenuItem("Open", lambda: win.after(0, win.deiconify), default=True),
-    pystray.MenuItem("Quit", lambda: win.after(0, quit_app))))
+
+tray = pystray.Icon("wallpaper_html", Image.open(ICON_ICO), "Wallpaper.HTML", pystray.Menu(pystray.MenuItem("Open", lambda: win.after(0, win.deiconify), default=True),pystray.MenuItem("Quit", lambda: win.after(0, quit_app))))
 tray.run_detached()
 win.protocol("WM_DELETE_WINDOW", win.withdraw)
 atexit.register(stop_wallpaper)
+threading.Thread(target=fullscreen_watcher, daemon=True).start()
+
+if settings["run_on_startup"]:
+    set_startup(True)
 
 if settings["current_wallpaper_dir"]:
     start_wallpaper()
