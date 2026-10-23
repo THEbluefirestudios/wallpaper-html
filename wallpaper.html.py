@@ -18,6 +18,7 @@ from tkinter import filedialog, messagebox, ttk
 import darkdetect
 import pyautogui
 import pystray
+import datetime
 import sv_ttk
 import webview
 import win32con
@@ -312,6 +313,26 @@ def attach_to_desktop(window):
     win32gui.SetWindowPos(hwnd, win32con.HWND_BOTTOM, 0, 0, w, h,  win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW)
 
 
+class WallpaperAPI:
+    def get_mouse_pos(self):
+        x, y = pyautogui.position()
+        w, h = pyautogui.size()
+        return {"x": x, "y": y, "w": w, "h": h}
+
+    def get_datetime(self):
+        n = datetime.datetime.now()
+        return {
+            "iso": n.isoformat(),
+            "year": n.year,
+            "month": n.month,
+            "day": n.day,
+            "hour": n.hour,
+            "minute": n.minute,
+            "second": n.second,
+            "weekday": n.weekday()
+        }
+
+
 def run_wallpaper():
     global TITLE
     os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = (
@@ -323,7 +344,7 @@ def run_wallpaper():
 
     if manifest["name"] != "Untitled":
         TITLE = manifest["name"]
-        window = webview.create_window(TITLE, html_file.resolve().as_uri(), frameless=True, easy_drag=False, x=0, y=0, width=SCREEN_WIDTH, height=SCREEN_HEIGHT, js_api=None)
+        window = webview.create_window(TITLE, html_file.resolve().as_uri(), frameless=True, easy_drag=False, x=0, y=0, width=SCREEN_WIDTH, height=SCREEN_HEIGHT, js_api=WallpaperAPI())
 
         def on_loaded():
             time.sleep(FIRST_FRAME_DELAY)
@@ -576,6 +597,7 @@ def quit_app():
 if "--wallpaper" in sys.argv:
     run_wallpaper()
     sys.exit()
+
 
 # if __name__ == "__main__": i dont remebr why i commented this, and then i forgot, and it still works so why should i care
 WALLPAPERS_DIR.mkdir(exist_ok=True)
