@@ -17,6 +17,7 @@ from tkinter import filedialog, messagebox, ttk
 #import block for gui stuff
 import darkdetect
 import pyautogui
+from pynput import mouse as pynput_mouse
 import pystray
 import datetime
 import sv_ttk
@@ -312,8 +313,41 @@ def attach_to_desktop(window):
     h = ctypes.windll.user32.GetSystemMetrics(1)
     win32gui.SetWindowPos(hwnd, win32con.HWND_BOTTOM, 0, 0, w, h,  win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW)
 
+GETANCESTOR_ROOT = 2
+
+DESKTOP_ROOT_CLASSES = {"Progman", "WorkerW"}
+
+scroll_lock = threading.Lock()
+scroll_counts = {"up": 0, "down": 0}
+mouse_listener = None #for now, hol up
+
+def is_cursor_on_desktop():
+    try:
+        hwnd = win32gui.WindowFromPoint(pyautogui.position())
+        root = win32gui.GetAncestor(hwnd, GETANCESTOR_ROOT)
+        return win32gui.GetClassName(root) in DESKTOP_ROOT_CLASSES
+    except Exception:
+        return False
+
+def on_scroll(x, y, dx, dy):
+    if not is_cursor_on_desktop():
+        return
+    with scroll_lock:
+        if dy > 0:
+            scroll_counts["up"] += 1
+        elif dy < 0:
+            scroll_counts["down"] += 1
+
+def ensure_mouse_listener():
+    global mouse_listener
+    if mouse_listener is None:
+        mouse_listener = pynput_mouse.Listener(on_scroll=on_scroll)
+        mouse_listener.start()
 
 class WallpaperAPI:
+    def __init__(self):
+        ensure_mouse_listener()
+
     def get_mouse_pos(self):
         x, y = pyautogui.position()
         w, h = pyautogui.size()
@@ -331,6 +365,20 @@ class WallpaperAPI:
             "second": n.second,
             "weekday": n.weekday()
         }
+
+    def get_mouse_buttons(self):
+        left = bool(win32api.GetAsyncKeyState(win32con.VK_LBUTTON) & 0x8000)
+        right = bool(win32api.GetAsyncKeyState(win32con.VK_RBUTTON) & 0x8000)
+        middle = bool(win32api.GetAsyncKeyState(win32con.VK_MBUTTON) & 0x8000)
+        held = "left" if left else "right" if right else "middle" if middle else None
+        return {"left": left, "right": right, "middle": middle, "held": held, "on_desktop": is_cursor_on_desktop()}
+
+    def get_scroll(self):
+        with scroll_lock:
+            result = dict(scroll_counts)
+            scroll_counts["up"] = 0
+            scroll_counts["down"] = 0
+        return result
 
 
 def run_wallpaper():
