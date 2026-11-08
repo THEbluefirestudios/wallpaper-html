@@ -7,11 +7,13 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
 import tkinter as tk
 import winreg
+from multiprocessing import shared_memory
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 #import block for gui stuff
@@ -59,7 +61,8 @@ DEFAULT_SETTINGS = {
     "run_on_startup": False,
     "hide_get_premium": False,
     "developer_mode": False,
-    "pause_on_fullscreen": True
+    "pause_on_fullscreen": True,
+    "show_startup_reminder": True
 }
 
 #the same ol' json funcs i use
@@ -313,13 +316,21 @@ def attach_to_desktop(window):
     h = ctypes.windll.user32.GetSystemMetrics(1)
     win32gui.SetWindowPos(hwnd, win32con.HWND_BOTTOM, 0, 0, w, h,  win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW)
 
+
 GETANCESTOR_ROOT = 2
 
 DESKTOP_ROOT_CLASSES = {"Progman", "WorkerW"}
 
-scroll_lock = threading.Lock()
-scroll_counts = {"up": 0, "down": 0}
-mouse_listener = None #for now, hol up
+SHARED_STATE_NAME = "wallpaper_html_shared_state"
+SHARED_STATE_STRUCT = struct.Struct("<iii")
+SCROLL_TOTALS_OFFSET = 0
+CURSOR_FLAG_OFFSET = 8
+
+scroll_totals = [0, 0]
+shared_state_memory = None
+mouse_listener = None
+cursor_state_thread = None
+
 
 def is_cursor_on_desktop():
     try:
@@ -329,24 +340,50 @@ def is_cursor_on_desktop():
     except Exception:
         return False
 
-def on_scroll(x, y, dx, dy):
-    if not is_cursor_on_desktop():
-        return
-    with scroll_lock:
-        if dy > 0:
-            scroll_counts["up"] += 1
-        elif dy < 0:
-            scroll_counts["down"] += 1
 
-def ensure_mouse_listener():
-    global mouse_listener
-    if mouse_listener is None:
-        mouse_listener = pynput_mouse.Listener(on_scroll=on_scroll)
-        mouse_listener.start()
+def publish_cursor_state():
+    while True:
+        flag = 1 if is_cursor_on_desktop() else 0
+        struct.pack_into("<i", shared_state_memory.buf, CURSOR_FLAG_OFFSET, flag)
+        time.sleep(0.05)
+
+
+def on_scroll(x, y, dx, dy):
+    if not struct.unpack_from("<i", shared_state_memory.buf, CURSOR_FLAG_OFFSET)[0]:
+        return
+    if dy > 0:
+        scroll_totals[0] += 1
+    elif dy < 0:
+        scroll_totals[1] += 1
+    struct.pack_into("<ii", shared_state_memory.buf, SCROLL_TOTALS_OFFSET, scroll_totals[0], scroll_totals[1])
+
+
+def start_shared_state():
+    global shared_state_memory, mouse_listener, cursor_state_thread
+    try:
+        shared_state_memory = shared_memory.SharedMemory(name=SHARED_STATE_NAME, create=True, size=SHARED_STATE_STRUCT.size)
+    except FileExistsError:
+        shared_state_memory = shared_memory.SharedMemory(name=SHARED_STATE_NAME)
+    SHARED_STATE_STRUCT.pack_into(shared_state_memory.buf, 0, 0, 0, 0)
+    cursor_state_thread = threading.Thread(target=publish_cursor_state, daemon=True)
+    cursor_state_thread.start()
+    mouse_listener = pynput_mouse.Listener(on_scroll=on_scroll)
+    mouse_listener.start()
+
 
 class WallpaperAPI:
     def __init__(self):
-        ensure_mouse_listener()
+        global shared_state_memory
+        try:
+            shared_state_memory = shared_memory.SharedMemory(name=SHARED_STATE_NAME)
+        except FileNotFoundError:
+            shared_state_memory = None
+        self._last_scroll_totals = self._read_shared_state()[:2]
+
+    def _read_shared_state(self):
+        if shared_state_memory is None:
+            return (0, 0, 0)
+        return SHARED_STATE_STRUCT.unpack_from(shared_state_memory.buf, 0)
 
     def get_mouse_pos(self):
         x, y = pyautogui.position()
@@ -371,14 +408,13 @@ class WallpaperAPI:
         right = bool(win32api.GetAsyncKeyState(win32con.VK_RBUTTON) & 0x8000)
         middle = bool(win32api.GetAsyncKeyState(win32con.VK_MBUTTON) & 0x8000)
         held = "left" if left else "right" if right else "middle" if middle else None
-        return {"left": left, "right": right, "middle": middle, "held": held, "on_desktop": is_cursor_on_desktop()}
+        return {"left": left, "right": right, "middle": middle, "held": held, "on_desktop": bool(self._read_shared_state()[2])}
 
     def get_scroll(self):
-        with scroll_lock:
-            result = dict(scroll_counts)
-            scroll_counts["up"] = 0
-            scroll_counts["down"] = 0
-        return result
+        up_total, down_total, _ = self._read_shared_state()
+        last_up, last_down = self._last_scroll_totals
+        self._last_scroll_totals = (up_total, down_total)
+        return {"up": max(up_total - last_up, 0), "down": max(down_total - last_down, 0)}
 
 
 def run_wallpaper():
@@ -626,6 +662,7 @@ def build_screen(crnt_scrn):
         add_setting_row(settings_frame, "Hide \"Get Premium\" option: ", "hide_get_premium", toggle_see_premium_btn)
         add_setting_row(settings_frame, "Developer Mode (Allow Non-verified wallpapers): ", "developer_mode")
         add_setting_row(settings_frame, "Pause wallpaper on fullscreened app: ", "pause_on_fullscreen")
+        add_setting_row(settings_frame, "Remind me to enable startup when opening the app: ", "show_startup_reminder")
 
 
 def build_ui():
@@ -640,6 +677,13 @@ def quit_app():
     stop_wallpaper()
     tray.stop()
     win.destroy()
+
+
+def open_window():
+    win.deiconify()
+    win.lift()
+    if settings["show_startup_reminder"] and not settings["run_on_startup"]:
+        messagebox.showinfo("Wallpaper.HTML", "Turn on \"Run Wallpaper.HTML on Startup\" in Settings so your wallpaper starts with Windows, and you don't have to manually start it every time.\n\nPwease 🥺", parent=win)
 
 
 if "--wallpaper" in sys.argv:
@@ -663,11 +707,12 @@ apply_theme_to_titlebar(win)
 build_ui()
 
 
-tray = pystray.Icon("wallpaper_html", Image.open(ICON_ICO), "Wallpaper.HTML", pystray.Menu(pystray.MenuItem("Open", lambda: win.after(0, win.deiconify), default=True),pystray.MenuItem("Quit", lambda: win.after(0, quit_app))))
+tray = pystray.Icon("wallpaper_html", Image.open(ICON_ICO), "Wallpaper.HTML", pystray.Menu(pystray.MenuItem("🖥️ Open", lambda: win.after(0, open_window), default=True),pystray.MenuItem("❌ Quit", lambda: win.after(0, quit_app))))
 tray.run_detached()
 win.protocol("WM_DELETE_WINDOW", win.withdraw)
 atexit.register(stop_wallpaper)
 threading.Thread(target=fullscreen_watcher, daemon=True).start()
+start_shared_state()
 
 if settings["run_on_startup"]:
     set_startup(True)

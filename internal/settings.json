@@ -1,7 +1,9 @@
 {
-  "current_wallpaper_dir": "saturn",
+  "current_wallpaper_dir": "blackhole",
   "run_on_startup": false,
   "hide_get_premium": false,
   "developer_mode": false,
-  "pause_on_fullscreen": true
+  "pause_on_fullscreen": true,
+  "show_startup_reminder": true,
+  "show_startup_popup": true
 }
