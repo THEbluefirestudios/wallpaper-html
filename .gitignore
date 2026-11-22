@@ -1,3 +1,5 @@
 wallpapers/bhnt/blackhole-warm.mp4
 wallpapers/*
 !wallpapers/.gitkeep
+build/*
+dist/*
