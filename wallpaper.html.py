@@ -37,7 +37,9 @@ try:
 except ImportError:
     pywinstyles = None
 #consts
-SCRIPT_DIR = Path(__file__).resolve().parent
+FROZEN = getattr(sys, "frozen", False)
+SCRIPT_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent #meipass issues, fix always happens when using pyinstaller and relative paths
+os.chdir(SCRIPT_DIR)
 INTERNAL_DIR = SCRIPT_DIR / "internal"
 WALLPAPERS_DIR = SCRIPT_DIR / "wallpapers"
 SETTINGS_FILE = INTERNAL_DIR / "settings.json"
@@ -128,6 +130,8 @@ wallpaper_started_at = 0.0
 wallpaper_paused = False
 process_lock = threading.RLock()
 
+LAUNCH_CMD = [sys.executable, "--wallpaper"] if FROZEN else [sys.executable, str(Path(__file__).resolve()), "--wallpaper"]
+
 
 def start_wallpaper():
     global wallpaper_process, wallpaper_started_at
@@ -135,7 +139,7 @@ def start_wallpaper():
     with process_lock:
         READY_FILE.unlink(missing_ok=True)
         wallpaper_started_at = time.monotonic()
-        wallpaper_process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--wallpaper"], creationflags=subprocess.CREATE_NO_WINDOW)
+        wallpaper_process = subprocess.Popen(LAUNCH_CMD, creationflags=subprocess.CREATE_NO_WINDOW)
 
 
 def stop_wallpaper():
@@ -253,10 +257,14 @@ def set_wallpaper(name):
 
 def set_startup(enabled):
     if enabled:
-        pythonw = Path(sys.executable).with_name("pythonw.exe")
-        exe = pythonw if pythonw.exists() else Path(sys.executable)
+        if FROZEN:
+            command = f'"{sys.executable}"'
+        else:
+            pythonw = Path(sys.executable).with_name("pythonw.exe")
+            exe = pythonw if pythonw.exists() else Path(sys.executable)
+            command = f'"{exe}" "{Path(__file__).resolve()}"'
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
-            winreg.SetValueEx(key, STARTUP_NAME, 0, winreg.REG_SZ, f'"{exe}" "{Path(__file__).resolve()}"')
+            winreg.SetValueEx(key, STARTUP_NAME, 0, winreg.REG_SZ, command)
         with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, STARTUP_APPROVED_KEY, 0, winreg.KEY_SET_VALUE) as key:
             winreg.SetValueEx(key, STARTUP_NAME, 0, winreg.REG_BINARY, b"\x02" + bytes(11))
     else:
@@ -344,18 +352,18 @@ def is_cursor_on_desktop():
 def publish_cursor_state():
     while True:
         flag = 1 if is_cursor_on_desktop() else 0
-        struct.pack_into("<i", shared_state_memory.buf, CURSOR_FLAG_OFFSET, flag)
+        struct.pack_into("<i", shared_state_memory.buf, CURSOR_FLAG_OFFSET, flag) #type: ignore
         time.sleep(0.05)
 
 
 def on_scroll(x, y, dx, dy):
-    if not struct.unpack_from("<i", shared_state_memory.buf, CURSOR_FLAG_OFFSET)[0]:
+    if not struct.unpack_from("<i", shared_state_memory.buf, CURSOR_FLAG_OFFSET)[0]:#type: ignore
         return
     if dy > 0:
         scroll_totals[0] += 1
     elif dy < 0:
         scroll_totals[1] += 1
-    struct.pack_into("<ii", shared_state_memory.buf, SCROLL_TOTALS_OFFSET, scroll_totals[0], scroll_totals[1])
+    struct.pack_into("<ii", shared_state_memory.buf, SCROLL_TOTALS_OFFSET, scroll_totals[0], scroll_totals[1])#type: ignore
 
 
 def start_shared_state():
@@ -364,7 +372,7 @@ def start_shared_state():
         shared_state_memory = shared_memory.SharedMemory(name=SHARED_STATE_NAME, create=True, size=SHARED_STATE_STRUCT.size)
     except FileExistsError:
         shared_state_memory = shared_memory.SharedMemory(name=SHARED_STATE_NAME)
-    SHARED_STATE_STRUCT.pack_into(shared_state_memory.buf, 0, 0, 0, 0)
+    SHARED_STATE_STRUCT.pack_into(shared_state_memory.buf, 0, 0, 0, 0)#type: ignore
     cursor_state_thread = threading.Thread(target=publish_cursor_state, daemon=True)
     cursor_state_thread.start()
     mouse_listener = pynput_mouse.Listener(on_scroll=on_scroll)
@@ -383,7 +391,7 @@ class WallpaperAPI:
     def _read_shared_state(self):
         if shared_state_memory is None:
             return (0, 0, 0)
-        return SHARED_STATE_STRUCT.unpack_from(shared_state_memory.buf, 0)
+        return SHARED_STATE_STRUCT.unpack_from(shared_state_memory.buf, 0)#type: ignore
 
     def get_mouse_pos(self):
         x, y = pyautogui.position()
