@@ -668,7 +668,7 @@ def build_screen(crnt_scrn):
 
         add_setting_row(settings_frame, "Run Wallpaper.HTML on Startup: ", "run_on_startup", lambda: set_startup(settings["run_on_startup"]))
         add_setting_row(settings_frame, "Hide \"Get Premium\" option: ", "hide_get_premium", toggle_see_premium_btn)
-        add_setting_row(settings_frame, "Developer Mode (Allow Non-verified wallpapers): ", "developer_mode")
+        add_setting_row(settings_frame, "Developer Mode (Placebo Setting): ", "developer_mode")
         add_setting_row(settings_frame, "Pause wallpaper on fullscreened app: ", "pause_on_fullscreen")
         add_setting_row(settings_frame, "Remind me to enable startup when opening the app: ", "show_startup_reminder")
 
